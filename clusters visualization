@@ -1,0 +1,108 @@
+
+Endometrium analysis - clusters visualization
+import numpy as np
+import pandas as pd
+import scanpy as sc
+import anndata
+import os
+import sys
+
+def MovePlots(plotpattern, subplotdir):
+    os.system('mkdir -p '+str(sc.settings.figdir)+'/'+subplotdir)
+    os.system('mv '+str(sc.settings.figdir)+'/*'+plotpattern+'** '+str(sc.settings.figdir)+'/'+subplotdir)
+
+sc.settings.verbosity = 1  # verbosity: errors (0), warnings (1), info (2), hints (3)
+sc.settings.figdir = './cellphoneDB/'
+sc.logging.print_versions()
+sc.settings.set_figure_params(dpi=80)  # low dpi (dots per inch) yields small inline figures
+
+sys.executable
+Prepare INPUT
+Load andata
+adata = sc.read('/lustre/scratch117/cellgen/team292/lh20/1gpunobooks/primary/N5-integrated_donors.h5ad')
+adata.X.shape
+# clean bytes
+adata.var.index = [ i.decode("utf-8") for i in adata.var.index]
+adata.obs.index = [ i.decode("utf-8") for i in adata.obs.index]
+adata.obs.subcluster_epithelial_balanced = [ i.decode("utf-8") for i in adata.obs.subcluster_epithelial_balanced]
+adata.obs.general_celltypes = [ i.decode("utf-8") for i in adata.obs.general_celltypes]
+# Visualize
+adata.obs.head()
+set(adata.obs.subcluster_epithelial_balanced)
+Merge cell annotations
+# remove non epithelial cells and build dictionary cell2type
+cell_annot = adata[[ i not in ['filtered', 'doublets', 'Low QC'] for i in adata.obs.subcluster_epithelial_balanced]].obs['subcluster_epithelial_balanced'].to_dict()
+# integrate annotations
+adata.obs['cell_type'] = adata.obs.general_celltypes.to_list()
+for i in cell_annot.keys():
+    adata.obs.at[i, 'cell_type'] = 'epi_' + cell_annot[i]
+set(adata.obs.cell_type)
+# remove epithelial cells that did not go into the zoom (lowQC)
+adata = adata[[ i not in ['Ciliated', 'Glandular', 'Lumenal', 'SOX9', 'filtered', 'Other'] for i in adata.obs.cell_type]]
+Remove endothelial, PV and UMSC
+... as they are not in contact with epithelial.
+
+Keep:
+
+Other epi
+Fibro and all stromal
+Mac
+T cells
+NK
+# remove epithelial cells that did not go into the zoom (lowQC)
+adata = adata[[ i not in ['uSMC', 'PV MYH11', 'PV STEAP4', 'Endothelial ACKR1', 'Endothelial SEMA3G', 'Other'] for i in adata.obs.cell_type]]
+set(adata.obs.cell_type)
+Save gene expression
+Generate the normalized but not log transformed matrix
+
+adata.X.shape
+adata_count = anndata.AnnData(X=adata.raw.X, var=adata.raw.var, obs=adata.obs, asview=False)
+sc.pp.filter_genes(adata_count, min_cells = 5)
+sc.pp.filter_cells(adata_count, min_genes = 200)
+sc.pp.normalize_per_cell(adata_count, counts_per_cell_after=1e4)
+adata_count.X.shape
+adata_count.obs['cell_type'] = adata_count.obs['cell_type'].astype('category')
+print(adata_count.obs['cell_type'].values.describe())
+Downsample clusters with > n cells - take n cells
+
+# # load cellphoneDB genes
+# genes_df = pd.aimport random
+import random
+from itertools import chain
+
+# Find clusters with > n cells
+n = 500
+cluster_counts = adata_count.obs['cell_type'].values.describe()
+cl2downsample = cluster_counts.index[ cluster_counts['counts'] > n ]
+
+# save all barcode ids from small clusters
+holder = []
+holder.append( adata_count.obs_names[[ i not in cl2downsample for i in adata_count.obs['cell_type'] ]] ) 
+
+# randomly sample n cells in the cl2downsample
+for cl in cl2downsample:
+    print(cl)
+    cl_sample = adata_count[[ i == cl for i in adata_count.obs['cell_type'] ]].obs_names
+    # n = int(round(len(cl_sample)/2, 0))
+    cl_downsample = random.sample(set(cl_sample), n )
+    holder.append(cl_downsample)
+    
+# samples to include
+samples = list(chain(*holder))
+
+# Filter adata_count
+adataF = adata_count[[ i in samples for i in adata_count.obs_names ]]
+print(adataF.obs['cell_type'].values.describe())
+adataF
+Save as csv
+
+adataF.var.index = [ i.decode("utf-8") for i in adataF.var.index]
+t = adataF.X.toarray().T
+# Set cell ids as column index and gene ids as row index
+df_expr_matrix = pd.DataFrame(data=t, columns= adataF.obs.index, index=adataF.var_names)
+df_expr_matrix.to_csv('cellphoneDB/counts.csv')
+Save meta
+df_meta = pd.DataFrame(data={'Cell':list(adataF.obs.index),
+                             'cell_type':[ i for i in adataF.obs['cell_type']] })
+df_meta.set_index('Cell', inplace=True)
+df_meta.to_csv('cellphoneDB/meta.tsv', sep = '\t')
