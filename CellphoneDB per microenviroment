@@ -1,0 +1,402 @@
+
+CellphoneDB per microenviroment
+This code uses DEGs computed for each cluster to identify relevant L/R interactions between the cells in a microenviroment
+
+
+library(dplyr)
+library(RColorBrewer)
+library(harmony)
+library(ggplot2)
+library(pheatmap)
+library(cowplot)
+library(reshape2)
+     
+Attaching package: ‘dplyr’
+
+
+The following objects are masked from ‘package:stats’:
+
+    filter, lag
+
+
+The following objects are masked from ‘package:base’:
+
+    intersect, setdiff, setequal, union
+
+
+Loading required package: Rcpp
+
+
+# Define cutoff variables
+filter_int_user_curated = T #Use only user_curated interactions?
+per_cutoff = 0.1 # min % of cells in the cluster required  with expression > 0 for the gene
+pval_cutoff = 0.005 # max adjusted p-value requeired to consider a gene as DEG
+logFC_cutoff = 0.2 # min logFC to consider a gene as DEG
+     
+Define the cells in your microenviroments
+
+lumenP = c('SOX9_LGR5', 'Ciliated', 'Preciliated')
+lumenS = c('Ciliated', 'Lumenal_1', 'Lumenal_2')
+functionalP = c('Fibroblast_eS', 'Endothelial_ACKR1', 'Endothelial_SEMA3G', 'PV_STEAP4', 'Lymphoid', 'Myeloid', 'SOX9_prolif')
+functionalS = c('Fibroblast_dS', 'Endothelial_ACKR1', 'Endothelial_SEMA3G', 'PV_STEAP4', 'Lymphoid', 'Myeloid', 'Glandular', 'Glandular_secretory')
+basalP = c('Fibroblast_C7', 'SOX9')
+basalS = c('Fibroblast_C7', 'SOX9')
+
+microenviroments = list(
+    lumenP = lumenP,
+    lumenS = lumenS,
+    functionalP = functionalP,
+    functionalS = functionalS,
+    basalP = basalP,
+    basalS = basalS
+)
+
+     
+Load cellphone database
+
+# Gene names
+genes_cpDB = read.delim('~/cellphoneDB/hsa_uniprot.txt', stringsAsFactors = F, sep = '\t')
+
+# Complexes members
+com_cpDB = read.csv('/home/jovyan/farm/endometrium/data/cellphoneDB/database/complex_generated.csv', stringsAsFactors = F)
+com_cpDB = unique(com_cpDB)
+com_cpDB$complex_name = paste0('complex:', com_cpDB$complex_name)
+# Generate complexes2gene symbol dictionary
+Com2Gene = lapply(com_cpDB$complex_name, function(cx) subset(genes_cpDB, uniprot %in% unlist(com_cpDB[com_cpDB$complex_name == cx, 2:5]) )
+complex_name
+                  
+# Load interactions from cellphoneDB/out/means.txt output file                   
+int_cpDB = read.delim('/home/jovyan/farm/endometrium_v2/invivo/cellphoneDB/out/means.txt', stringsAsFactors = F)[, 1:10]
+# MANDATORY: remove "curated" because we have cleaned and renamed them (this is a long story, just do it)
+int_cpDB = subset(int_cpDB, annotation_strategy != 'curated')
+# OPTIONAL: Use only user_curated interactions?
+if(filter_int_user_curated)
+    int_cpDB = subset(int_cpDB, annotation_strategy == 'user_curated')
+# Generate Int2Gene dictionary
+Int2Gene = apply(int_cpDB, 1, function(int) {
+    int = unname(int)
+    if(int[5] == '') # if partnerA is complex, then retrieve members from dictionary
+       partnerA = Com2Gene[[int[3]]]
+    else  # if partnerA is a single gene, take name from file
+       partnerA = int[5]
+    if(int[6] == '')  # if partnerB is complex, then retrieve members from dictionary
+       partnerB = Com2Gene[[int[4]]]
+    else  # if partnerB is a single gene, take name from file
+       partnerB = int[6]
+    list(partner_a=partnerA,partner_b=partnerB)
+    }) 
+names(Int2Gene) = int_cpDB$interacting_pair
+     
+Load cluster's gene percentage expression
+
+# Load percentage expression info
+# Matrix of genes (rows) per celltypes (columns) containing the proportion [0-1] of cells 
+# in a celltype expressing the gene
+path_Exp = '/lustre/scratch117/cellgen/team292/lh20/Sharing/Luz/PercentExpressed.csv'
+
+# Load matrix
+Per_df = read.csv(path_Exp, stringsAsFactors = F, row.names = 1) 
+# Format ....
+rownames(Per_df) = Per_df[,1]
+Per_df = Per_df[, grep('PcentExpressed_broad_', colnames(Per_df), invert = T) ]
+Per_df = Per_df[, grep('PcentExpressed_', colnames(Per_df)) ]
+colnames(Per_df) = gsub('PcentExpressed_', '', colnames(Per_df))
+colnames(Per_df) = gsub('^ciliated', 'Ciliated', colnames(Per_df))
+colnames(Per_df) = gsub('pre.ciliated', 'Preciliated', colnames(Per_df))
+
+# Dictionary of celltypes2expressed genes
+is_Exp = apply(Per_df, 2, function(x) names(which(x>per_cutoff)) )
+names(is_Exp)
+     
+'SOX9'
+'SOX9_prolif'
+'SOX9_LGR5'
+'Lumenal_1'
+'Lumenal_2'
+'Glandular'
+'Glandular_secretory'
+'Preciliated'
+'Ciliated'
+'Ciliated_LRG5'
+'Fibroblast_dS'
+'Fibroblast_eS'
+'Fibroblast_C7'
+'uSMC'
+'PV_STEAP4'
+'PV_MYH11'
+'Endothelial_ACKR1'
+'Endothelial_SEMA3G'
+'Endothelial_Lymphoid'
+'Endothelial_Myeloid'
+Load DE expression info
+
+# List of tables (one per celltype) containing DEGs info.
+# Each table in the list is a DEG signature for each celltype.
+# Each table must contain at least four columns (aka, you can reuse the output of the DEG files in Seurat):
+# - Gene: gene symbol
+# - cluster: cell type
+# - adj.P.Val: adjusted p-value from the DE test
+# - logFC: from the DE test
+# path_DE = '/lustre/scratch117/cellgen/team292/lh20/Sharing/Luz/epithelial_DEtables.rds'
+path_DE = '/lustre/scratch117/cellgen/team292/lh20/Sharing/Luz/finecelltypes_DEtables.rds'
+DE_df = readRDS(path_DE)
+
+# # Remove genes not in cellphone
+DE_df = lapply(DE_df, function(x) subset(x, rownames(x) %in% genes_cpDB$gene_name )) 
+names(DE_df) = gsub('Epithelial_', '', names(DE_df))
+               
+# # Build dictionary clusters2DEGs
+is_DE = lapply(DE_df, function(x) rownames(subset(x, WilcoxLog10Pvalue_fdr_corr < log10(pval_cutoff) & Log2FC >= logFC_cutoff)) )
+is_DE = lapply(is_DE, sort)
+               
+# length(DE_df)
+names(is_DE)
+     
+'Endothelial_ACKR1'
+'Endothelial_SEMA3G'
+'Ciliated'
+'Ciliated_LRG5'
+'Glandular'
+'Glandular_secretory'
+'Lumenal_1'
+'Lumenal_2'
+'Preciliated'
+'SOX9'
+'SOX9_LGR5'
+'SOX9_prolif'
+'Fibroblast_C7'
+'Fibroblast_dS'
+'Fibroblast_eS'
+'Lymphoid'
+'Myeloid'
+'PV_MYH11'
+'PV_STEAP4'
+'uSMC'
+Define cell pairs to test
+
+# Get all pairwise cluster combinations: A--B, B--A
+cluster_combinations = combn(names(is_Exp), 2, simplify = T)
+ncol(cluster_combinations)
+
+# add self interactions
+cluster_combinations = cbind(sapply(names(is_Exp), function(x) rep(x, 2) ), cluster_combinations)
+
+# We only want to test pairs including at least one celltype in the DE folder
+keep = apply(cluster_combinations, 2, function(x) any(x %in% names(is_DE)))
+cluster_combinations = cluster_combinations[, keep]
+
+# Consider the reverse interaction too: A--B but B--A as well
+cluster_combinations = cbind(cluster_combinations, cluster_combinations[2:1,]) %>% t(.) %>% unique(.)  %>% t(.) 
+     
+190
+Filter pairs in microenviroments
+
+microenviroments
+     
+$lumenP
+'SOX9_LGR5'
+'Ciliated'
+'Preciliated'
+$lumenS
+'Ciliated'
+'Lumenal_1'
+'Lumenal_2'
+$functionalP
+'Fibroblast_eS'
+'Endothelial_ACKR1'
+'Endothelial_SEMA3G'
+'PV_STEAP4'
+'Lymphoid'
+'Myeloid'
+'SOX9_prolif'
+$functionalS
+'Fibroblast_dS'
+'Endothelial_ACKR1'
+'Endothelial_SEMA3G'
+'PV_STEAP4'
+'Lymphoid'
+'Myeloid'
+'Glandular'
+'Glandular_secretory'
+$basalP
+'Fibroblast_C7'
+'SOX9'
+$basalS
+'Fibroblast_C7'
+'SOX9'
+
+# Filter interactions within microenviroments
+within_idx = c()
+for (mienv in microenviroments){
+    x = apply(cluster_combinations, 1, function(x) x %in% mienv) 
+    within_idx = c(within_idx,
+                   which(x[, 1] + x[, 2] == 2))
+}
+cluster_combinations = cluster_combinations[, within_idx]
+              
+     
+
+# Make cluster pair labels: celltypeA--celltypeB             
+cluster_combinations_labels = apply(cluster_combinations, 2, paste, collapse = '---')
+ncol(cluster_combinations)
+             
+colnames(cluster_combinations) = cluster_combinations_labels
+     
+87
+Retrieve CellphoneDB L/R interactions
+A relevant interaction shoudl have
+
+all their participants expressed in the corresponding celltypes
+At least one participant is a DEG
+
+# Make scaffold matrix: L/R interactions (rows) x celltype pairs (columns)
+E = matrix(0, nrow = length(Int2Gene), ncol = length(cluster_combinations_labels), 
+           dimnames = list(names(Int2Gene), cluster_combinations_labels) )
+dim(E) # is it big?
+     
+
+# E will be a binary matrix with 1 indicating that all the genes in the interaction are expressed in the corresponding celltype
+# So, fill 1 if all genes are expressed in all clusters
+for (Int in rownames(E)){ # iterate over interactions
+    for (clpair in colnames(E)){ # iterate over celltype pairs
+        cl_A = cluster_combinations[1, clpair] # celltype_A
+        cl_B = cluster_combinations[2, clpair] # celltype_B
+        are_all_expressed = all(Int2Gene[[Int]]$partner_a %in% is_Exp[[cl_A]]) &&  # are all partner_A genes expressed in celltype_A
+                            all(Int2Gene[[Int]]$partner_b %in% is_Exp[[cl_B]])     # are all partner_B genes expressed in celltype_B
+        if(are_all_expressed)
+            E[Int, clpair] = 1
+    }
+}
+     
+
+# keep celltypepairs with at least one expressed interaction
+keep = apply(E, 2, sum) > 0
+E = E[,keep]
+# is it big?
+dim(E)
+sum(E)
+     
+1407
+73
+6872
+
+# keep interactions expressed in at least one celltype pair
+keep = apply(E, 1, sum) > 0
+E = E[keep,]
+# is it big?
+dim(E)
+sum(E)
+     
+556
+73
+6872
+
+# Initialize DE matrix from E and set all values to 0
+# DE will be a binary matrix with 1 indicating that all the genes in the interaction are expressed in the corresponding celltype
+# and one is a DE in the celltypes of interests
+DE = E
+DE[] = 0
+     
+
+# So, fill 1 if at least one gene in the interaction is DE
+for (Int in rownames(DE)){ # iterate over interactions
+    for (clpair in colnames(DE)){ # iterate over celltype pairs
+        cl_A = cluster_combinations[1, clpair] # celltype_A
+        cl_B = cluster_combinations[2, clpair] # celltype_B
+        any_DE = any(Int2Gene[[Int]]$partner_a %in% is_DE[[cl_A]]) ||  # is any partner_A gene DE in celltype_A
+                 any(Int2Gene[[Int]]$partner_b %in% is_DE[[cl_B]])     # is any partner_B gene DE in celltype_B
+        if(any_DE & E[Int, clpair] == 1) # check all members are expressed
+            DE[Int, clpair] = 1
+    }
+}
+     
+
+# keep interactions expressed in at least one celltype pair
+keep = apply(DE, 1, sum) > 0
+DE = DE[keep,]
+# keep celltypepairs with at least one interaction
+keep = apply(DE, 2, sum) > 0
+DE = DE[, keep]
+# is it big?
+dim(DE)
+sum(DE)
+     
+550
+73
+4973
+
+# Done!
+DE
+     
+A matrix: 550 × 73 of type dbl
+SOX9_LGR5---SOX9_LGR5	Preciliated---Preciliated	Ciliated---Ciliated	SOX9_LGR5---Preciliated	SOX9_LGR5---Ciliated	Preciliated---Ciliated	Preciliated---SOX9_LGR5	Ciliated---SOX9_LGR5	Ciliated---Preciliated	Lumenal_1---Lumenal_1	⋯	PV_STEAP4---Glandular_secretory	Endothelial_ACKR1---Glandular_secretory	Endothelial_SEMA3G---Glandular_secretory	PV_STEAP4---Fibroblast_dS	Endothelial_ACKR1---Fibroblast_dS	Endothelial_SEMA3G---Fibroblast_dS	SOX9---SOX9	Fibroblast_C7---Fibroblast_C7	SOX9---Fibroblast_C7	Fibroblast_C7---SOX9
+IGF2_IGF1R	0	0	1	0	0	1	1	1	0	0	⋯	1	0	1	0	0	0	0	0	0	1
+IGF1_IGF1R	1	0	1	0	1	1	1	1	0	0	⋯	1	0	0	0	0	0	1	0	0	1
+IGF2_IGF2R	0	0	0	0	0	0	1	1	0	0	⋯	0	0	0	1	0	1	0	1	0	1
+CCL2_ACKR1	0	0	0	0	0	0	0	0	0	0	⋯	0	0	0	0	0	0	0	0	0	0
+CXCL1_ACKR1	0	0	0	0	0	0	0	0	0	0	⋯	0	0	0	0	0	0	0	0	0	0
+CXCL8_ACKR1	0	0	0	0	0	0	0	0	0	0	⋯	0	0	0	0	0	0	0	0	1	0
+SFRP4_WNT5B	0	0	0	0	0	0	0	0	0	0	⋯	0	0	0	1	1	1	0	0	0	0
+SFRP1_WNT5B	0	0	0	0	0	0	0	0	0	0	⋯	0	0	0	1	0	0	0	0	0	0
+FRZB_WNT5B	0	0	0	0	0	0	0	0	0	0	⋯	0	0	0	1	0	0	0	0	0	0
+SFRP4_WNT2B	1	0	0	0	0	0	1	1	0	0	⋯	0	0	0	0	0	0	0	0	0	0
+SFRP1_WNT2B	0	0	0	0	0	0	1	0	0	0	⋯	0	0	0	0	0	0	0	0	0	0
+FRZB_WNT2B	0	0	0	0	0	0	0	0	0	0	⋯	0	0	0	0	0	0	0	0	0	1
+SFRP4_WNT6	0	0	0	0	0	0	0	0	0	0	⋯	0	0	0	0	0	0	0	0	0	0
+SFRP1_WNT6	0	0	0	0	0	0	0	0	0	0	⋯	0	0	0	0	0	0	0	0	0	0
+FRZB_WNT6	0	0	0	0	0	0	0	0	0	0	⋯	0	0	0	0	0	0	0	0	0	0
+NOTCH1_JAG1	1	1	1	1	1	1	1	1	1	1	⋯	1	1	1	1	1	1	0	0	0	0
+CD46_JAG1	1	1	1	1	1	1	1	1	1	1	⋯	0	0	1	0	0	1	1	0	0	0
+NOTCH1_CNTN1	0	0	0	0	0	0	0	0	0	0	⋯	0	0	0	0	0	0	0	0	0	0
+NOTCH2_CNTN1	0	0	0	0	0	0	0	0	0	0	⋯	0	0	0	0	0	0	0	0	0	0
+NOTCH1_DLL4	0	0	0	0	0	0	0	0	0	0	⋯	0	0	0	0	0	0	0	0	0	0
+NOTCH2_DLL4	0	0	0	0	0	0	0	0	0	0	⋯	0	0	0	0	0	0	0	0	0	0
+NOTCH4_DLL4	0	0	0	0	0	0	0	0	0	0	⋯	0	0	0	0	0	0	0	0	0	0
+NOTCH1_JAG2	0	0	1	0	1	1	0	0	0	1	⋯	0	0	0	0	0	0	0	0	0	0
+NOTCH2_JAG2	0	0	1	0	1	1	0	0	0	1	⋯	0	0	0	0	0	0	0	0	0	0
+NOTCH4_JAG2	0	0	0	0	0	1	0	0	0	0	⋯	0	0	0	0	0	0	0	0	0	0
+NOTCH3_JAG2	0	0	0	0	1	1	0	0	0	1	⋯	0	0	0	0	0	0	0	0	0	0
+APP_SORL1	1	0	1	0	1	1	1	1	0	1	⋯	1	1	1	0	0	0	1	0	0	1
+LGALS9_P4HB	1	0	0	1	1	0	0	0	0	0	⋯	0	1	1	0	1	1	1	0	0	0
+SIRPA_CD47	0	0	0	0	0	0	0	0	0	0	⋯	0	0	0	0	0	0	0	0	0	0
+CADM1_CADM1	1	0	0	1	1	0	1	1	0	1	⋯	0	0	1	0	0	0	1	0	0	0
+⋮	⋮	⋮	⋮	⋮	⋮	⋮	⋮	⋮	⋮	⋮	⋱	⋮	⋮	⋮	⋮	⋮	⋮	⋮	⋮	⋮	⋮
+PDGFB_PDGFR_complex	0	0	0	0	0	0	0	0	0	0	⋯	0	0	0	0	1	1	0	0	1	0
+GDF11_TGFR_AVR2A	0	0	0	0	0	0	0	0	0	0	⋯	0	0	0	0	0	0	0	0	0	0
+GDF11_TGFR_AVR2B	0	0	0	0	0	0	0	0	0	0	⋯	0	0	0	0	0	0	1	0	0	0
+IGF1_integrin_a6b4_complex	1	0	1	0	1	1	1	1	0	1	⋯	1	0	0	0	0	0	1	0	0	1
+TGFB1_TGFbeta_receptor1	0	0	0	0	0	0	0	0	0	0	⋯	0	0	0	1	1	1	0	0	0	0
+TGFB3_TGFbeta_receptor1	0	0	0	0	0	0	0	0	0	0	⋯	0	0	0	1	0	0	0	0	0	0
+TGFB2_TGFbeta_receptor1	0	0	0	0	0	0	0	0	0	0	⋯	0	0	0	1	0	0	0	0	0	0
+TGFB1_TGFbeta_receptor2	0	0	0	0	0	0	0	0	0	0	⋯	1	1	1	1	1	1	0	0	0	0
+TGFB3_TGFbeta_receptor2	0	0	0	0	0	0	0	0	0	0	⋯	1	0	0	1	0	0	0	0	0	0
+TGFB2_TGFbeta_receptor2	0	0	0	0	0	0	0	0	0	0	⋯	1	0	0	1	0	0	0	0	0	0
+TGFB3_integrin_aVb8_complex	0	0	0	0	0	0	0	0	0	0	⋯	1	0	0	1	0	0	0	0	0	1
+PTGER4_ProstaglandinE2_byPTGES	0	0	0	0	0	0	0	0	0	0	⋯	0	0	0	0	0	0	0	0	0	0
+PTGER2_ProstaglandinE2_byPTGES	0	0	0	0	0	0	1	1	0	0	⋯	0	0	0	0	0	0	0	0	0	0
+PTGER3_ProstaglandinE2_byPTGES2	0	0	0	0	0	0	0	0	0	0	⋯	0	0	0	0	0	0	0	0	0	1
+PTGER4_ProstaglandinE2_byPTGES2	0	0	0	0	0	0	0	0	0	0	⋯	0	0	1	0	0	1	0	0	0	0
+PTGER2_ProstaglandinE2_byPTGES2	0	0	1	0	0	0	0	1	1	0	⋯	0	0	0	0	0	0	0	0	0	0
+PTGER3_ProstaglandinE2_byPTGES3	0	0	0	0	0	0	0	0	0	0	⋯	0	0	0	0	0	0	0	1	0	1
+PTGER4_ProstaglandinE2_byPTGES3	0	0	0	0	0	0	0	0	0	0	⋯	0	0	1	0	0	1	0	0	0	0
+PTGER2_ProstaglandinE2_byPTGES3	0	1	1	0	0	1	0	1	1	0	⋯	0	0	0	0	0	0	0	0	0	0
+PTGIR_Prostacyclin_byPTGIS	0	0	0	0	0	0	0	0	0	0	⋯	0	0	0	0	0	0	0	0	0	0
+DHH_PTCH_BOC_transmembrane_receptor	0	0	0	0	0	0	0	0	0	0	⋯	0	0	0	0	0	0	0	0	0	0
+DHH_PTCH_GAS1_transmembrane_receptor	0	0	0	0	0	0	0	0	0	0	⋯	0	0	0	0	0	1	0	0	0	0
+PDGFR_complex_PDGFD	0	0	0	0	0	0	0	0	0	0	⋯	0	0	0	0	0	0	0	0	0	0
+AR_Testosterone_byHSD17B12	0	0	0	0	0	0	0	0	0	0	⋯	0	0	0	0	0	0	0	0	0	0
+PTCH_BOC_transmembrane_receptor _IHH	0	0	0	1	1	0	0	0	0	0	⋯	0	0	0	0	0	0	0	0	0	0
+PTCH_BOC_transmembrane_receptor _SHH	0	0	0	1	0	0	0	0	0	0	⋯	0	0	0	0	0	0	0	0	0	0
+PTCH_GAS1_transmembrane_receptor _SHH	0	0	0	0	0	0	0	0	0	0	⋯	0	0	0	0	0	0	0	0	0	0
+RORB_atRetinoicAcid_byALDH1A1	0	0	0	0	0	0	0	0	0	0	⋯	0	0	0	1	0	0	0	0	0	0
+RORB_atRetinoicAcid_byALDH1A2	0	0	0	0	0	0	0	0	0	0	⋯	0	0	0	1	0	0	0	0	0	0
+RORB_atRetinoicAcid_byALDH1A3	0	0	0	0	0	0	0	0	0	0	⋯	0	0	0	1	0	0	0	0	0	0
+Save matrix
+
+# So DE is our output matrix
+# Is big, filter it accordingly for visualization
+write.csv(DE, file = paste0('/home/jovyan/farm/endometrium_v2/invivo/cellphoneDB/out/DEapproach_results_pval', pval_cutoff, '_logFC', logFC_cutoff, '.csv'))
+     
+
+
+     
